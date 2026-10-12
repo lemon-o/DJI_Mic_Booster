@@ -11,7 +11,7 @@ use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
+use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, SetProcessWorkingSetSize};
 use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows_sys::Win32::UI::Shell::*;
@@ -20,6 +20,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 // 自定义消息与常量
 const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_SLIDER_CHANGED: u32 = WM_APP + 2;
+const WM_APP_WAKEUP: u32 = WM_APP + 3;
 
 const TBM_SETPOS: u32 = 0x0405;
 const TBM_GETPOS: u32 = 0x0400;
@@ -244,6 +245,8 @@ struct AppState {
     brush_bg: HBRUSH,
     brush_card: HBRUSH,
     nid: NOTIFYICONDATAW,
+    tray_added: bool,
+    msg_taskbar_created: u32,
 }
 
 impl AppState {
@@ -253,8 +256,12 @@ impl AppState {
         controller.set_gain_db(config.gain_db);
 
         if config.auto_start && !autostart::is_auto_start_registered() {
-            autostart::set_auto_start(true);
+            autostart::set_auto_start(true, config.silent_start);
         }
+
+        let msg_taskbar_created = unsafe {
+            RegisterWindowMessageW(wide_str("TaskbarCreated").as_ptr())
+        };
 
         Self {
             gain_db: config.gain_db,
@@ -281,6 +288,8 @@ impl AppState {
             brush_bg: 0,
             brush_card: 0,
             nid: unsafe { std::mem::zeroed() },
+            tray_added: false,
+            msg_taskbar_created,
         }
     }
 
@@ -292,7 +301,7 @@ impl AppState {
             let mut detected = None;
             for dev in &self.input_devices {
                 let lower = dev.to_lowercase();
-                if lower.contains("wireless mic") || lower.contains("dji") {
+                if lower.contains("wireless mic") || lower.contains("dji") || lower.contains("usb") {
                     detected = Some(dev.clone());
                     break;
                 }
@@ -355,13 +364,16 @@ impl AppState {
 
     unsafe fn set_autostart(&mut self, enable: bool) {
         self.config.auto_start = enable;
-        autostart::set_auto_start(enable);
+        autostart::set_auto_start(enable, self.config.silent_start);
         self.config.save();
         InvalidateRect(self.hwnd_chk_autostart, null_mut(), 1);
     }
 
     unsafe fn set_silent_start(&mut self, enable: bool) {
         self.config.silent_start = enable;
+        if self.config.auto_start {
+            autostart::set_auto_start(true, enable);
+        }
         self.config.save();
         InvalidateRect(self.hwnd_chk_silent, null_mut(), 1);
     }
@@ -435,7 +447,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
 
             // 现代扁平滑块控件
             state.hwnd_slider = CreateWindowExW(
-                0, wide_str("DJIFlatSliderClass").as_ptr(), null_mut(),
+                0, wide_str("USBMicFlatSliderClass").as_ptr(), null_mut(),
                 WS_CHILD | WS_VISIBLE,
                 32, 136, 376, 24, hwnd, ID_SLIDER, inst, null_mut(),
             );
@@ -494,10 +506,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             state.nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
             state.nid.uCallbackMessage = WM_APP_TRAY;
             state.nid.hIcon = final_icon;
-            let tip = wide_str("DJI Mic Mini 增益助手");
+            let tip = wide_str("USB麦克风增益助手");
             let copy_len = tip.len().min(state.nid.szTip.len() - 1);
             state.nid.szTip[..copy_len].copy_from_slice(&tip[..copy_len]);
-            Shell_NotifyIconW(NIM_ADD, &state.nid);
+            if Shell_NotifyIconW(NIM_ADD, &state.nid) != 0 {
+                state.tray_added = true;
+            }
 
             state.refresh_device_list();
             state.update_gain_ui();
@@ -851,8 +865,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
 
         WM_APP_TRAY => {
             let event = lparam as u32;
-            if event == WM_LBUTTONDBLCLK {
+            if event == WM_LBUTTONUP || event == WM_LBUTTONDBLCLK {
                 ShowWindow(hwnd, SW_SHOW);
+                ShowWindow(hwnd, SW_RESTORE);
                 SetForegroundWindow(hwnd);
             } else if event == WM_RBUTTONUP && !state_ptr.is_null() {
                 let state = &*state_ptr;
@@ -882,9 +897,21 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             0
         }
 
+        WM_APP_WAKEUP => {
+            ShowWindow(hwnd, SW_SHOW);
+            ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
+            0
+        }
+
         WM_TIMER => {
             if !state_ptr.is_null() && wparam == TIMER_METER {
                 let state = &mut *state_ptr;
+                if !state.tray_added {
+                    if Shell_NotifyIconW(NIM_ADD, &state.nid) != 0 {
+                        state.tray_added = true;
+                    }
+                }
                 if state.engine.is_some() {
                     let cur_peak = state.controller.get_peak();
                     if cur_peak >= state.display_peak {
@@ -924,6 +951,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             0
         }
 
+        msg if !state_ptr.is_null() && msg == (*state_ptr).msg_taskbar_created => {
+            let state = &mut *state_ptr;
+            if Shell_NotifyIconW(NIM_ADD, &state.nid) != 0 {
+                state.tray_added = true;
+            }
+            0
+        }
+
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
@@ -949,10 +984,30 @@ fn wide_str(s: &str) -> Vec<u16> {
 
 fn main() {
     unsafe {
+        // 单实例检测互斥体 (防止程序多开)
+        let mutex_name = wide_str("Local\\USBMicBooster_SingleInstance_Mutex");
+        let h_mutex = CreateMutexW(null_mut(), 1, mutex_name.as_ptr());
+        if h_mutex != 0 && GetLastError() == ERROR_ALREADY_EXISTS {
+            let class_name = wide_str("USBMicBoosterWin32Class");
+            let mut hwnd_existing = FindWindowW(class_name.as_ptr(), null_mut());
+            if hwnd_existing == 0 {
+                let legacy_class_name = wide_str("DJIMicBoosterWin32Class");
+                hwnd_existing = FindWindowW(legacy_class_name.as_ptr(), null_mut());
+            }
+            if hwnd_existing != 0 {
+                PostMessageW(hwnd_existing, WM_APP_WAKEUP, 0, 0);
+                ShowWindow(hwnd_existing, SW_SHOW);
+                ShowWindow(hwnd_existing, SW_RESTORE);
+                SetForegroundWindow(hwnd_existing);
+            }
+            CloseHandle(h_mutex);
+            return;
+        }
+
         let instance = GetModuleHandleW(null_mut());
 
         // 注册自定义扁平滑块窗口类
-        let slider_class_name = wide_str("DJIFlatSliderClass");
+        let slider_class_name = wide_str("USBMicFlatSliderClass");
         let slider_wc = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(slider_wnd_proc),
@@ -968,9 +1023,10 @@ fn main() {
         RegisterClassW(&slider_wc);
 
         // 注册主窗口类
-        let class_name = wide_str("DJIMicBoosterWin32Class");
+        let class_name = wide_str("USBMicBoosterWin32Class");
+        let args: Vec<String> = std::env::args().collect();
+        let is_silent = args.iter().any(|arg| arg == "--silent");
         let app_state = Box::new(AppState::new());
-        let is_silent = app_state.config.silent_start;
 
         let h_app_icon = LoadIconW(instance, 1 as *const u16);
         let final_icon = if h_app_icon != 0 { h_app_icon } else { LoadIconW(0, IDI_APPLICATION) };
@@ -1000,7 +1056,7 @@ fn main() {
         let pos_x = (screen_w - win_width) / 2;
         let pos_y = (screen_h - win_height) / 2;
 
-        let title = wide_str("DJI Mic Mini 增益助手");
+        let title = wide_str("USB麦克风增益助手");
 
         let hwnd = CreateWindowExW(
             0,
@@ -1017,6 +1073,7 @@ fn main() {
             Box::into_raw(app_state) as *mut _,
         );
 
+
         if !is_silent {
             ShowWindow(hwnd, SW_SHOW);
             UpdateWindow(hwnd);
@@ -1030,6 +1087,10 @@ fn main() {
         while GetMessageW(&mut msg, 0, 0, 0) > 0 {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+
+        if h_mutex != 0 {
+            CloseHandle(h_mutex);
         }
     }
 }

@@ -1,7 +1,11 @@
 [package]
-name = "dji_mic_booster"
+name = "usb_mic_booster"
 version = "0.1.0"
 edition = "2021"
+
+[[bin]]
+name = "USB_Mic_Booster"
+path = "src/main.rs"
 
 [dependencies]
 cpal = "0.15"
@@ -19,6 +23,7 @@ windows-sys = { version = "0.52", features = [
     "Win32_UI_Shell",
     "Win32_System_Registry",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Security",
 ] }
 
 [profile.release]

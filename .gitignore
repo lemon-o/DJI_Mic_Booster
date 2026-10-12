@@ -1,4 +1,5 @@
 /target
 /DJI_Mic_Booster.exe
+/USB_Mic_Booster.exe
 booster_config.json
 *.pdb
