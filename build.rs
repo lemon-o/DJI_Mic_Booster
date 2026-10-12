@@ -4,6 +4,7 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=app.rc");
     println!("cargo:rerun-if-changed=app.ico");
+    println!("cargo:rerun-if-changed=app.manifest");
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let res_path = format!("{}/app.res", out_dir);
@@ -19,7 +20,7 @@ fn main() {
     for rc in rc_paths {
         if Path::new(rc).exists() || rc == "rc.exe" {
             let status = Command::new(rc)
-                .args(&["/fo", &res_path, "app.rc"])
+                .args(&["/c", "65001", "/fo", &res_path, "app.rc"])
                 .status();
             if let Ok(s) = status {
                 if s.success() {

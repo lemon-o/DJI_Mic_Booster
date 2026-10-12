@@ -6,14 +6,19 @@ mod config;
 
 use audio::{AudioController, AudioEngine};
 use config::AppConfig;
+use std::path::PathBuf;
 use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, SetProcessWorkingSetSize};
+use windows_sys::Win32::System::Threading::{
+    CreateMutexW, GetCurrentProcess, SetProcessWorkingSetSize, WaitForSingleObject,
+};
 use windows_sys::Win32::UI::Controls::*;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE,
+};
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -21,6 +26,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_SLIDER_CHANGED: u32 = WM_APP + 2;
 const WM_APP_WAKEUP: u32 = WM_APP + 3;
+const WM_APP_CHECK_DRIVER: u32 = WM_APP + 5;
+const WM_APP_DEVICE_REFRESH: u32 = WM_APP + 6;
+const WM_DEVICECHANGE: u32 = 0x0219;
 
 const TBM_SETPOS: u32 = 0x0405;
 const TBM_GETPOS: u32 = 0x0400;
@@ -50,9 +58,83 @@ const ID_TRAY_EXIT: usize = 205;
 const ID_MENU_DEVICE_BASE: usize = 300;
 
 const TIMER_METER: usize = 1;
+const TIMER_HOTPLUG: usize = 2;
 
 const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
+}
+
+struct HoverControlData {
+    old_proc: WNDPROC,
+    is_hovered: bool,
+}
+
+unsafe extern "system" fn hover_button_subclass_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let data_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut HoverControlData;
+    if data_ptr.is_null() {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    let data = &mut *data_ptr;
+    let old_proc = data.old_proc;
+
+    match msg {
+        WM_MOUSEMOVE => {
+            if !data.is_hovered {
+                data.is_hovered = true;
+                let mut tme: TRACKMOUSEEVENT = std::mem::zeroed();
+                tme.cbSize = std::mem::size_of::<TRACKMOUSEEVENT>() as u32;
+                tme.dwFlags = TME_LEAVE;
+                tme.hwndTrack = hwnd;
+                TrackMouseEvent(&mut tme);
+                InvalidateRect(hwnd, null_mut(), 0);
+            }
+        }
+        WM_MOUSELEAVE => {
+            data.is_hovered = false;
+            InvalidateRect(hwnd, null_mut(), 0);
+        }
+        WM_SETCURSOR => {
+            SetCursor(LoadCursorW(0, IDC_HAND));
+            return 1;
+        }
+        WM_DESTROY => {
+            let _ = Box::from_raw(data_ptr);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            return CallWindowProcW(old_proc, hwnd, msg, wparam, lparam);
+        }
+        _ => {}
+    }
+
+    CallWindowProcW(old_proc, hwnd, msg, wparam, lparam)
+}
+
+unsafe fn attach_hover_effect(hwnd: HWND) {
+    let old_proc_raw = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+    let old_proc: WNDPROC = std::mem::transmute(old_proc_raw);
+    let data = Box::new(HoverControlData {
+        old_proc,
+        is_hovered: false,
+    });
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(data) as isize);
+    SetWindowLongPtrW(
+        hwnd,
+        GWLP_WNDPROC,
+        hover_button_subclass_proc as *const () as usize as isize,
+    );
+}
+
+unsafe fn is_control_hovered(hwnd: HWND) -> bool {
+    let data_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut HoverControlData;
+    if !data_ptr.is_null() {
+        (*data_ptr).is_hovered
+    } else {
+        false
+    }
 }
 
 struct SliderData {
@@ -247,13 +329,17 @@ struct AppState {
     nid: NOTIFYICONDATAW,
     tray_added: bool,
     msg_taskbar_created: u32,
+    driver_prompted: bool,
+    timer_ticks: u32,
 }
 
 impl AppState {
     fn new() -> Self {
         let config = AppConfig::load();
+        let selected_input = config.input_device.clone();
+        let gain_db = config.get_gain_for_device(&selected_input);
         let controller = AudioController::new();
-        controller.set_gain_db(config.gain_db);
+        controller.set_gain_db(gain_db);
 
         if config.auto_start && !autostart::is_auto_start_registered() {
             autostart::set_auto_start(true, config.silent_start);
@@ -264,8 +350,8 @@ impl AppState {
         };
 
         Self {
-            gain_db: config.gain_db,
-            selected_input: config.input_device.clone(),
+            gain_db,
+            selected_input,
             selected_output: config.output_device.clone(),
             config,
             controller,
@@ -290,6 +376,99 @@ impl AppState {
             nid: unsafe { std::mem::zeroed() },
             tray_added: false,
             msg_taskbar_created,
+            driver_prompted: false,
+            timer_ticks: 0,
+        }
+    }
+
+    fn has_virtual_cable(&self) -> bool {
+        self.output_devices.iter().any(|dev| {
+            let lower = dev.to_lowercase();
+            lower.contains("cable input") && !lower.contains("16ch")
+        })
+    }
+
+    unsafe fn check_and_prompt_driver(&mut self, hwnd: HWND, is_manual: bool) {
+        if self.has_virtual_cable() {
+            return;
+        }
+
+        if self.driver_prompted && !is_manual {
+            return;
+        }
+        self.driver_prompted = true;
+
+        let prompt = "检测到系统尚未安装 VB-Audio 虚拟音频驱动（CABLE Input/Output）。\n\n本软件需要该驱动将放大后的人声实时传输给腾讯会议、OBS、微信等通话软件使用。\n\n是否立即启动驱动安装程序？";
+        let title = "USB麦克风增益助手 - 驱动就绪提示";
+        let ret = MessageBoxW(
+            hwnd,
+            wide_str(prompt).as_ptr(),
+            wide_str(title).as_ptr(),
+            MB_YESNO | MB_ICONQUESTION,
+        );
+
+        if ret == IDYES {
+            self.launch_vbcable_installer(hwnd);
+        }
+    }
+
+    unsafe fn launch_vbcable_installer(&self, hwnd: HWND) {
+        if let Some(installer_path) = find_vbcable_installer() {
+            let dir = installer_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+            let exe_w = wide_str(&installer_path.to_string_lossy());
+            let dir_w = wide_str(&dir.to_string_lossy());
+
+            let verb_w = wide_str("runas");
+            let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
+            info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+            info.fMask = SEE_MASK_NOCLOSEPROCESS;
+            info.hwnd = hwnd;
+            info.lpVerb = verb_w.as_ptr();
+            info.lpFile = exe_w.as_ptr();
+            info.lpDirectory = dir_w.as_ptr();
+            info.nShow = SW_SHOWNORMAL;
+
+            if ShellExecuteExW(&mut info) != 0 && info.hProcess != 0 {
+                let h_proc = info.hProcess;
+                let hwnd_usize = hwnd as usize;
+
+                std::thread::spawn(move || {
+                    WaitForSingleObject(h_proc, 0xFFFFFFFF);
+                    CloseHandle(h_proc);
+                    // 等待 Windows 音频子系统重新加载虚拟声卡设备
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    PostMessageW(hwnd_usize as HWND, WM_APP_DEVICE_REFRESH, 0, 0);
+                });
+            } else {
+                let err = GetLastError();
+                if err != 1223 {
+                    let err_msg = format!("启动安装程序失败，错误代码: {}", err);
+                    MessageBoxW(
+                        hwnd,
+                        wide_str(&err_msg).as_ptr(),
+                        wide_str("错误").as_ptr(),
+                        MB_OK | MB_ICONERROR,
+                    );
+                }
+            }
+        } else {
+            let not_found = "未在程序目录下找到 VBCABLE_Driver 驱动安装文件夹。\n\n是否打开 VB-Audio 官网下载虚拟声卡驱动？";
+            if MessageBoxW(
+                hwnd,
+                wide_str(not_found).as_ptr(),
+                wide_str("未找到驱动文件").as_ptr(),
+                MB_YESNO | MB_ICONINFORMATION,
+            ) == IDYES
+            {
+                ShellExecuteW(
+                    0,
+                    wide_str("open").as_ptr(),
+                    wide_str("https://vb-audio.com/Cable/").as_ptr(),
+                    null_mut(),
+                    null_mut(),
+                    SW_SHOWNORMAL,
+                );
+            }
         }
     }
 
@@ -297,18 +476,29 @@ impl AppState {
         self.input_devices = audio::list_input_devices();
         self.output_devices = audio::list_output_devices();
 
+        let prev_selected = self.selected_input.clone();
         if self.selected_input.is_empty() || !self.input_devices.contains(&self.selected_input) {
-            let mut detected = None;
-            for dev in &self.input_devices {
-                let lower = dev.to_lowercase();
-                if lower.contains("wireless mic") || lower.contains("dji") || lower.contains("usb") {
-                    detected = Some(dev.clone());
-                    break;
-                }
-            }
-            self.selected_input = detected
+            self.selected_input = self.config
+                .get_fallback_device(&self.input_devices)
+                .or_else(|| {
+                    self.input_devices.iter().find(|dev| {
+                        let lower = dev.to_lowercase();
+                        lower.contains("wireless mic") || lower.contains("dji") || lower.contains("usb")
+                    }).cloned()
+                })
                 .or_else(|| self.input_devices.first().cloned())
                 .unwrap_or_default();
+        }
+
+        // 若输入设备发生变动，恢复该设备独立保存的增益值并更新 UI
+        if self.selected_input != prev_selected {
+            self.gain_db = self.config.get_gain_for_device(&self.selected_input);
+            self.controller.set_gain_db(self.gain_db);
+            self.update_gain_ui();
+        }
+
+        if !self.selected_input.is_empty() {
+            self.config.push_device_history(&self.selected_input);
         }
 
         // 后台全自动静默寻找并绑定 CABLE Input 虚拟声卡
@@ -320,13 +510,106 @@ impl AppState {
                 break;
             }
         }
-        self.selected_output = found_cable
-            .or_else(|| self.output_devices.first().cloned())
-            .unwrap_or_default();
+        self.selected_output = found_cable.unwrap_or_default();
 
         self.save_settings();
         self.start_or_restart_stream();
         InvalidateRect(self.hwnd_in_combo, null_mut(), 1);
+    }
+
+    unsafe fn check_device_changes(&mut self, hwnd: HWND) {
+        let current_inputs = audio::list_input_devices();
+        let current_outputs = audio::list_output_devices();
+
+        let had_stream_error = self.controller.get_last_error().is_some();
+        if had_stream_error {
+            self.controller.clear_error();
+        }
+
+        // 1. 检查是否有新设备插入
+        let newly_inserted: Vec<String> = current_inputs
+            .iter()
+            .filter(|d| !self.input_devices.contains(d))
+            .cloned()
+            .collect();
+
+        // 2. 检查当前活跃设备是否丢失（物理断开或 WASAPI 回调报告设备异常）
+        let active_device_lost = !self.selected_input.is_empty()
+            && (!current_inputs.contains(&self.selected_input) || had_stream_error);
+
+        let mut need_stream_restart = false;
+        let mut device_switched = false;
+
+        if !newly_inserted.is_empty() {
+            // 场景一：新设备插入 -> 自动切换到新插入的麦克风
+            let new_mic = newly_inserted[0].clone();
+
+            // 若已有当前设备，将当前设备推入历史记录备用
+            if !self.selected_input.is_empty() {
+                self.config.push_device_history(&self.selected_input);
+            }
+
+            self.selected_input = new_mic.clone();
+            self.config.push_device_history(&new_mic);
+
+            // 恢复新设备专属增益值并更新 UI
+            self.gain_db = self.config.get_gain_for_device(&self.selected_input);
+            self.controller.set_gain_db(self.gain_db);
+            self.update_gain_ui();
+
+            need_stream_restart = true;
+            device_switched = true;
+        } else if active_device_lost {
+            // 场景二：当前麦克风拔出或流故障 -> 自动回退到上一个历史设备
+            self.engine = None;
+
+            // 候选设备：排除已断开/故障的当前设备
+            let candidates: Vec<String> = current_inputs
+                .iter()
+                .filter(|d| *d != &self.selected_input)
+                .cloned()
+                .collect();
+
+            if let Some(fallback_mic) = self.config.get_fallback_device(&candidates) {
+                self.selected_input = fallback_mic;
+                self.gain_db = self.config.get_gain_for_device(&self.selected_input);
+                self.controller.set_gain_db(self.gain_db);
+                self.update_gain_ui();
+                need_stream_restart = true;
+            } else {
+                self.selected_input.clear();
+            }
+            device_switched = true;
+        }
+
+        // 3. 检查输出设备（CABLE Input 虚拟声卡）
+        let mut found_cable = None;
+        for dev in &current_outputs {
+            let lower = dev.to_lowercase();
+            if lower.contains("cable input") && !lower.contains("16ch") {
+                found_cable = Some(dev.clone());
+                break;
+            }
+        }
+        let target_output = found_cable.unwrap_or_default();
+        if self.selected_output != target_output {
+            self.selected_output = target_output;
+            need_stream_restart = true;
+        }
+
+        let lists_changed = self.input_devices != current_inputs || self.output_devices != current_outputs;
+        self.input_devices = current_inputs;
+        self.output_devices = current_outputs;
+
+        if device_switched || need_stream_restart {
+            self.save_settings();
+            self.start_or_restart_stream();
+        }
+
+        if device_switched || lists_changed {
+            InvalidateRect(self.hwnd_in_combo, null_mut(), 1);
+            RedrawWindow(hwnd, null_mut(), 0, RDW_INVALIDATE | RDW_ALLCHILDREN);
+        }
     }
 
     unsafe fn update_gain_ui(&self) {
@@ -335,11 +618,12 @@ impl AppState {
         SetWindowTextW(self.hwnd_gain_label, wide_str(&text).as_ptr());
         let pos = (self.gain_db * 10.0).round() as isize;
         SendMessageW(self.hwnd_slider, TBM_SETPOS, 0, pos);
-        InvalidateRect(self.hwnd_main, null_mut(), 0);
+        InvalidateRect(self.hwnd_slider, null_mut(), 0);
+        RedrawWindow(self.hwnd_main, null_mut(), 0, RDW_INVALIDATE | RDW_ALLCHILDREN);
     }
 
     fn save_settings(&mut self) {
-        self.config.gain_db = self.gain_db;
+        self.config.set_gain_for_device(&self.selected_input, self.gain_db);
         self.config.input_device = self.selected_input.clone();
         self.config.output_device = self.selected_output.clone();
         self.config.save();
@@ -422,6 +706,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW_U,
                 350, 20, 58, 24, hwnd, ID_REFRESH_BTN, inst, null_mut(),
             );
+            attach_hover_effect(state.hwnd_refresh_btn);
 
             // 扁平化下拉框按钮
             state.hwnd_in_combo = CreateWindowExW(
@@ -429,6 +714,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW_U,
                 32, 48, 376, 30, hwnd, ID_IN_COMBO, inst, null_mut(),
             );
+            attach_hover_effect(state.hwnd_in_combo);
 
             // 2. 前级增益与电平卡片 (中间卡片，高 144)
             let h_lbl_gain_sec = CreateWindowExW(
@@ -463,6 +749,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     x, 168, 68, 26, hwnd, *id, inst, null_mut(),
                 );
                 SendMessageW(h_btn, WM_SETFONT, state.font_small as WPARAM, 1);
+                attach_hover_effect(h_btn);
             }
 
             // 实时输出电平表
@@ -485,12 +772,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW_U,
                 32, 256, 120, 22, hwnd, ID_CHECK_AUTOSTART, inst, null_mut(),
             );
+            attach_hover_effect(state.hwnd_chk_autostart);
 
             state.hwnd_chk_silent = CreateWindowExW(
                 0, wide_str("BUTTON").as_ptr(), wide_str("").as_ptr(),
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW_U,
                 168, 256, 240, 22, hwnd, ID_CHECK_SILENT, inst, null_mut(),
             );
+            attach_hover_effect(state.hwnd_chk_silent);
 
             // 加载嵌入的程序图标 (ID 1)
             let h_icon = LoadIconW(inst, 1 as *const u16);
@@ -517,6 +806,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             state.update_gain_ui();
 
             SetTimer(hwnd, TIMER_METER, 33, None);
+            PostMessageW(hwnd, WM_APP_CHECK_DRIVER, 0, 0);
             0
         }
 
@@ -588,7 +878,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let rc = (*dis).rcItem;
 
             if id == ID_CHECK_AUTOSTART || id == ID_CHECK_SILENT {
-                // 100% 扁平化复选框绘制
+                let is_hovered = is_control_hovered((*dis).hwndItem);
                 let is_checked = if id == ID_CHECK_AUTOSTART {
                     state.config.auto_start
                 } else {
@@ -609,8 +899,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 let box_rc = RECT { left: box_left, top: box_top, right: box_left + 16, bottom: box_top + 16 };
 
                 if is_checked {
-                    let brush_box = CreateSolidBrush(rgb(37, 99, 235)); // #2563EB
-                    let pen_box = CreatePen(PS_SOLID as i32, 1, rgb(37, 99, 235));
+                    let box_bg = if is_hovered { rgb(29, 78, 216) } else { rgb(37, 99, 235) };
+                    let brush_box = CreateSolidBrush(box_bg);
+                    let pen_box = CreatePen(PS_SOLID as i32, 1, box_bg);
                     let old_b = SelectObject(hdc, brush_box);
                     let old_p = SelectObject(hdc, pen_box);
                     RoundRect(hdc, box_rc.left, box_rc.top, box_rc.right, box_rc.bottom, 4, 4);
@@ -629,8 +920,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     DeleteObject(brush_box);
                     DeleteObject(pen_box);
                 } else {
+                    let border_col = if is_hovered { rgb(148, 163, 184) } else { rgb(203, 213, 225) };
                     let brush_box = CreateSolidBrush(rgb(255, 255, 255));
-                    let pen_box = CreatePen(PS_SOLID as i32, 1, rgb(203, 213, 225)); // #CBD5E1
+                    let pen_box = CreatePen(PS_SOLID as i32, 1, border_col);
                     let old_b = SelectObject(hdc, brush_box);
                     let old_p = SelectObject(hdc, pen_box);
                     RoundRect(hdc, box_rc.left, box_rc.top, box_rc.right, box_rc.bottom, 4, 4);
@@ -642,7 +934,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
 
                 // 绘制文本
                 SetBkMode(hdc, TRANSPARENT as i32);
-                SetTextColor(hdc, rgb(51, 65, 85));
+                let text_col = if is_hovered { rgb(15, 23, 42) } else { rgb(51, 65, 85) };
+                SetTextColor(hdc, text_col);
                 let old_font = SelectObject(hdc, state.font_normal);
                 let mut text_rc = RECT { left: box_left + 24, top: 0, right: rc.right, bottom: rc.bottom };
                 let wtext = wide_str(text);
@@ -654,8 +947,18 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
 
             if id == ID_IN_COMBO {
                 // 100% 扁平化下拉框绘制
-                let brush_btn = CreateSolidBrush(rgb(255, 255, 255));
-                let pen_btn = CreatePen(PS_SOLID as i32, 1, rgb(203, 213, 225));
+                let is_hovered = is_control_hovered((*dis).hwndItem);
+                let is_pressed = ((*dis).itemState & 0x0001) != 0;
+                let bg_color = if is_pressed { rgb(248, 250, 252) } else { rgb(255, 255, 255) };
+                let border_color = if is_pressed {
+                    rgb(37, 99, 235)
+                } else if is_hovered {
+                    rgb(59, 130, 246)
+                } else {
+                    rgb(203, 213, 225)
+                };
+                let brush_btn = CreateSolidBrush(bg_color);
+                let pen_btn = CreatePen(PS_SOLID as i32, 1, border_color);
                 let old_b = SelectObject(hdc, brush_btn);
                 let old_p = SelectObject(hdc, pen_btn);
                 RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 6, 6);
@@ -666,16 +969,25 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
 
                 // 绘制设备名称
                 SetBkMode(hdc, TRANSPARENT as i32);
-                SetTextColor(hdc, rgb(30, 41, 59));
+                SetTextColor(hdc, if is_hovered { rgb(15, 23, 42) } else { rgb(30, 41, 59) });
                 let old_font = SelectObject(hdc, state.font_normal);
                 let mut text_rc = RECT { left: rc.left + 12, top: rc.top, right: rc.right - 28, bottom: rc.bottom };
-                let dev_name = if state.selected_input.is_empty() { "请选择麦克风".to_string() } else { state.selected_input.clone() };
+                let dev_name = if state.selected_input.is_empty() {
+                    if state.input_devices.is_empty() {
+                        "无可用麦克风".to_string()
+                    } else {
+                        "请选择麦克风".to_string()
+                    }
+                } else {
+                    state.selected_input.clone()
+                };
                 let wdev = wide_str(&dev_name);
                 DrawTextW(hdc, wdev.as_ptr(), -1, &mut text_rc, DT_LEFT as u32 | DT_VCENTER as u32 | DT_SINGLELINE as u32 | 0x00004000); // DT_END_ELLIPSIS
 
                 // 绘制右侧下拉箭头 ▾
                 let mut arrow_rc = RECT { left: rc.right - 26, top: rc.top, right: rc.right - 8, bottom: rc.bottom };
-                SetTextColor(hdc, rgb(100, 116, 139));
+                let arrow_col = if is_hovered { rgb(59, 130, 246) } else { rgb(100, 116, 139) };
+                SetTextColor(hdc, arrow_col);
                 let warrow = wide_str("▾");
                 DrawTextW(hdc, warrow.as_ptr(), -1, &mut arrow_rc, DT_CENTER as u32 | DT_VCENTER as u32 | DT_SINGLELINE as u32);
                 SelectObject(hdc, old_font);
@@ -748,20 +1060,35 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 is_active = (state.gain_db - 22.0).abs() < 0.1;
             }
 
-            let bg_color = if is_active {
-                rgb(37, 99, 235)
+            let is_hovered = is_control_hovered((*dis).hwndItem);
+            let is_pressed = ((*dis).itemState & 0x0001) != 0; // ODS_SELECTED
+
+            let (bg_color, border_color, text_color) = if id == ID_REFRESH_BTN {
+                if is_pressed {
+                    (rgb(219, 234, 254), rgb(37, 99, 235), rgb(29, 78, 216))
+                } else if is_hovered {
+                    (rgb(239, 246, 255), rgb(59, 130, 246), rgb(37, 99, 235))
+                } else {
+                    (rgb(248, 250, 252), rgb(203, 213, 225), rgb(71, 85, 105))
+                }
+            } else if is_active {
+                // 激活选中状态
+                if is_pressed {
+                    (rgb(30, 64, 175), rgb(23, 37, 84), rgb(255, 255, 255))
+                } else if is_hovered {
+                    (rgb(29, 78, 216), rgb(30, 64, 175), rgb(255, 255, 255))
+                } else {
+                    (rgb(37, 99, 235), rgb(29, 78, 216), rgb(255, 255, 255))
+                }
             } else {
-                rgb(241, 245, 249)
-            };
-            let border_color = if is_active {
-                rgb(29, 78, 216)
-            } else {
-                rgb(203, 213, 225)
-            };
-            let text_color = if is_active {
-                rgb(255, 255, 255)
-            } else {
-                rgb(51, 65, 85)
+                // 未激活状态
+                if is_pressed {
+                    (rgb(203, 213, 225), rgb(100, 116, 139), rgb(15, 23, 42))
+                } else if is_hovered {
+                    (rgb(226, 232, 240), rgb(148, 163, 184), rgb(15, 23, 42))
+                } else {
+                    (rgb(241, 245, 249), rgb(203, 213, 225), rgb(51, 65, 85))
+                }
             };
 
             let brush = CreateSolidBrush(bg_color);
@@ -795,6 +1122,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
 
                 if id == ID_REFRESH_BTN {
                     state.refresh_device_list();
+                    state.check_and_prompt_driver(hwnd, true);
                 } else if id == ID_IN_COMBO {
                     // 弹出设备选择菜单
                     let mut pt = POINT { x: 32, y: 48 + 30 };
@@ -810,6 +1138,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 } else if id >= ID_MENU_DEVICE_BASE as isize && id < (ID_MENU_DEVICE_BASE + state.input_devices.len()) as isize {
                     let idx = (id as usize) - ID_MENU_DEVICE_BASE;
                     state.selected_input = state.input_devices[idx].clone();
+                    state.config.push_device_history(&state.selected_input);
+                    // 恢复该麦克风设备单独保存的增益值并更新 UI
+                    state.gain_db = state.config.get_gain_for_device(&state.selected_input);
+                    state.controller.set_gain_db(state.gain_db);
+                    state.update_gain_ui();
                     state.save_settings();
                     state.start_or_restart_stream();
                     InvalidateRect(state.hwnd_in_combo, null_mut(), 1);
@@ -847,6 +1180,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 } else if id == ID_TRAY_SHOW as isize {
                     ShowWindow(hwnd, SW_SHOW);
                     SetForegroundWindow(hwnd);
+                    if !state.has_virtual_cable() && !state.driver_prompted {
+                        state.check_and_prompt_driver(hwnd, false);
+                    }
                 } else if id == ID_TRAY_MUTE as isize {
                     state.toggle_mute();
                 } else if id == ID_TRAY_AUTOSTART as isize {
@@ -869,6 +1205,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 ShowWindow(hwnd, SW_SHOW);
                 ShowWindow(hwnd, SW_RESTORE);
                 SetForegroundWindow(hwnd);
+                if !state_ptr.is_null() {
+                    let state = &mut *state_ptr;
+                    if !state.has_virtual_cable() && !state.driver_prompted {
+                        state.check_and_prompt_driver(hwnd, false);
+                    }
+                }
             } else if event == WM_RBUTTONUP && !state_ptr.is_null() {
                 let state = &*state_ptr;
                 let mut pt: POINT = std::mem::zeroed();
@@ -901,32 +1243,84 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             ShowWindow(hwnd, SW_SHOW);
             ShowWindow(hwnd, SW_RESTORE);
             SetForegroundWindow(hwnd);
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                if !state.has_virtual_cable() && !state.driver_prompted {
+                    state.check_and_prompt_driver(hwnd, false);
+                }
+            }
+            0
+        }
+
+        WM_APP_CHECK_DRIVER => {
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                let args: Vec<String> = std::env::args().collect();
+                let is_silent = args.iter().any(|arg| arg == "--silent");
+                if !is_silent {
+                    state.check_and_prompt_driver(hwnd, false);
+                }
+            }
+            0
+        }
+
+        WM_APP_DEVICE_REFRESH => {
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                state.refresh_device_list();
+                if state.has_virtual_cable() {
+                    MessageBoxW(
+                        hwnd,
+                        wide_str("VB-Audio 虚拟声卡驱动检测成功！\n已自动绑定输出设备。\n\n提示：如部分会议/录音软件尚未识别该设备，建议根据提示重启电脑以完全激活。").as_ptr(),
+                        wide_str("虚拟声卡就绪").as_ptr(),
+                        MB_OK | MB_ICONINFORMATION,
+                    );
+                }
+            }
+            0
+        }
+
+        WM_DEVICECHANGE => {
+            // Windows 设备插拔广播，设置 350ms 去抖定时器，等待 WASAPI 音频端点就绪
+            SetTimer(hwnd, TIMER_HOTPLUG, 350, None);
             0
         }
 
         WM_TIMER => {
-            if !state_ptr.is_null() && wparam == TIMER_METER {
+            if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
-                if !state.tray_added {
-                    if Shell_NotifyIconW(NIM_ADD, &state.nid) != 0 {
-                        state.tray_added = true;
-                    }
-                }
-                if state.engine.is_some() {
-                    let cur_peak = state.controller.get_peak();
-                    if cur_peak >= state.display_peak {
-                        state.display_peak = cur_peak;
-                    } else {
-                        state.display_peak = state.display_peak * 0.84 + cur_peak * 0.16;
-                    }
-                } else {
-                    state.display_peak *= 0.8;
-                    if state.display_peak < 0.005 {
-                        state.display_peak = 0.0;
-                    }
-                }
+                if wparam == TIMER_HOTPLUG {
+                    KillTimer(hwnd, TIMER_HOTPLUG);
+                    state.check_device_changes(hwnd);
+                } else if wparam == TIMER_METER {
+                    state.timer_ticks = state.timer_ticks.wrapping_add(1);
 
-                InvalidateRect(state.hwnd_meter, null_mut(), 0);
+                    // 若音频流检测到设备断开错误，或者每 30 次 tick (约 1 秒) 心跳检测，实时检查设备变动
+                    if state.controller.get_last_error().is_some() || (state.timer_ticks % 30 == 0) {
+                        state.check_device_changes(hwnd);
+                    }
+
+                    if !state.tray_added {
+                        if Shell_NotifyIconW(NIM_ADD, &state.nid) != 0 {
+                            state.tray_added = true;
+                        }
+                    }
+                    if state.engine.is_some() {
+                        let cur_peak = state.controller.get_peak();
+                        if cur_peak >= state.display_peak {
+                            state.display_peak = cur_peak;
+                        } else {
+                            state.display_peak = state.display_peak * 0.84 + cur_peak * 0.16;
+                        }
+                    } else {
+                        state.display_peak *= 0.8;
+                        if state.display_peak < 0.005 {
+                            state.display_peak = 0.0;
+                        }
+                    }
+
+                    InvalidateRect(state.hwnd_meter, null_mut(), 0);
+                }
             }
             0
         }
@@ -938,6 +1332,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
 
         WM_DESTROY => {
             KillTimer(hwnd, TIMER_METER);
+            KillTimer(hwnd, TIMER_HOTPLUG);
             if !state_ptr.is_null() {
                 let state = Box::from_raw(state_ptr);
                 Shell_NotifyIconW(NIM_DELETE, &state.nid);
@@ -978,14 +1373,76 @@ unsafe fn create_font(face: &str, height_pt: i32, bold: bool) -> HFONT {
     )
 }
 
+fn find_vbcable_installer() -> Option<PathBuf> {
+    let setup_files = ["VBCABLE_Setup_x64.exe", "VBCABLE_Setup.exe"];
+    let mut search_dirs = Vec::new();
+
+    // 1. 可执行文件所在目录及其祖先目录
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(parent) = exe_path.parent() {
+            search_dirs.push(parent.join("VBCABLE_Driver"));
+            if let Some(gp) = parent.parent().and_then(|p| p.parent()) {
+                search_dirs.push(gp.join("VBCABLE_Driver"));
+            }
+        }
+    }
+
+    // 2. 当前工作目录
+    search_dirs.push(PathBuf::from("VBCABLE_Driver"));
+
+    for dir in search_dirs {
+        for file in &setup_files {
+            let candidate = dir.join(file);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
 fn wide_str(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// 启用 Windows GDI 高 DPI 缩放 (Windows 10 1703+)
+/// 保持原有逻辑坐标系不变，底层由 GDI 直接以屏幕物理高清像素光栅化文本与线条，彻底消除模糊拉伸
+unsafe fn enable_gdi_dpi_scaling() {
+    type SetProcessDpiAwarenessContextFn = unsafe extern "system" fn(isize) -> BOOL;
+    type SetProcessDPIAwareFn = unsafe extern "system" fn() -> BOOL;
+
+    let user32 = GetModuleHandleW(wide_str("user32.dll").as_ptr());
+    if user32 != 0 {
+        use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
+
+        // Windows 10 1703+ 引入的 GDI DPI 缩放技术
+        // DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED = -5
+        let s_dpi_ctx = b"SetProcessDpiAwarenessContext\0";
+        if let Some(proc) = GetProcAddress(user32, s_dpi_ctx.as_ptr()) {
+            let func: SetProcessDpiAwarenessContextFn = std::mem::transmute(proc);
+            if func(-5) != 0 {
+                return;
+            }
+        }
+
+        // 旧版 Windows 系统的平稳降级
+        let s_dpi_aware = b"SetProcessDPIAware\0";
+        if let Some(proc) = GetProcAddress(user32, s_dpi_aware.as_ptr()) {
+            let func: SetProcessDPIAwareFn = std::mem::transmute(proc);
+            func();
+        }
+    }
+}
+
 fn main() {
     unsafe {
+        // 开启 Windows GDI 高清 DPI 缩放
+        enable_gdi_dpi_scaling();
+
         // 单实例检测互斥体 (防止程序多开)
         let mutex_name = wide_str("Local\\USBMicBooster_SingleInstance_Mutex");
+        SetLastError(0);
         let h_mutex = CreateMutexW(null_mut(), 1, mutex_name.as_ptr());
         if h_mutex != 0 && GetLastError() == ERROR_ALREADY_EXISTS {
             let class_name = wide_str("USBMicBoosterWin32Class");
@@ -1073,7 +1530,6 @@ fn main() {
             Box::into_raw(app_state) as *mut _,
         );
 
-
         if !is_silent {
             ShowWindow(hwnd, SW_SHOW);
             UpdateWindow(hwnd);
@@ -1091,6 +1547,27 @@ fn main() {
 
         if h_mutex != 0 {
             CloseHandle(h_mutex);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_vbcable_installer() {
+        let installer = find_vbcable_installer();
+        assert!(installer.is_some(), "Should find VBCABLE installer");
+        let path = installer.unwrap();
+        assert!(path.exists(), "Installer path should exist");
+        println!("Found installer at: {:?}", path);
+    }
+
+    #[test]
+    fn test_dpi_symbols() {
+        unsafe {
+            enable_gdi_dpi_scaling();
         }
     }
 }

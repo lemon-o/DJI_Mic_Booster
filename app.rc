@@ -1,1 +1,48 @@
+#pragma code_page(65001)
+
 1 ICON "app.ico"
+1 24 "app.manifest"
+
+1 VERSIONINFO
+FILEVERSION 0,2,0,0
+PRODUCTVERSION 0,2,0,0
+FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+FILEFLAGS 0x1L
+#else
+FILEFLAGS 0x0L
+#endif
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName", "lemon-o"
+            VALUE "FileDescription", "USB 麦克风增益助手"
+            VALUE "FileVersion", "0.2.0.0"
+            VALUE "InternalName", "USB_Mic_Booster"
+            VALUE "LegalCopyright", "Copyright (C) 2026 lemon-o"
+            VALUE "OriginalFilename", "USB_Mic_Booster.exe"
+            VALUE "ProductName", "USB 麦克风增益助手"
+            VALUE "ProductVersion", "0.2.0"
+        END
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "lemon-o"
+            VALUE "FileDescription", "USB Microphone Booster"
+            VALUE "FileVersion", "0.2.0.0"
+            VALUE "InternalName", "USB_Mic_Booster"
+            VALUE "LegalCopyright", "Copyright (C) 2026 lemon-o"
+            VALUE "OriginalFilename", "USB_Mic_Booster.exe"
+            VALUE "ProductName", "USB Microphone Booster"
+            VALUE "ProductVersion", "0.2.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200, 0x0409, 1200
+    END
+END

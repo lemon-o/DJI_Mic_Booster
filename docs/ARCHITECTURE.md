@@ -187,7 +187,7 @@ SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
 ```toml
 [package]
 name = "usb_mic_booster"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [[bin]]
@@ -203,3 +203,31 @@ strip = true         # 剥离所有符号表与调试元数据
 ```
 
 并通过 `build.rs` 调用 Windows SDK 的 `rc.exe` 自动编译 `app.rc` 资源清单文件，将应用程序图标（ID 1）直接静态嵌入 PE 可执行文件中，实现无外部依赖的单文件分发。
+
+---
+
+## 7. 设备智能热插拔与独立增益记忆
+
+### 7.1 独立设备增益记忆 (Per-Device Gain Memory)
+为了应对用户频繁插拔切换不同设备（例如桌面电容麦需要 +6dB，而无线领夹麦需要 +22dB）的痛点，配置引擎采用键值映射：
+```rust
+pub struct AppConfig {
+    ...
+    pub device_gains: HashMap<String, f32>,
+    pub device_history: Vec<String>,
+}
+```
+- **增益独立隔离**：每款麦克风单独记忆上次配置的 dB 增益值；
+- **旧版平滑升级**：自动迁移旧版全局单值配置，向后兼容；
+- **切换瞬时应用**：设备发生变动时，自动加载该设备的增益值、重置音频增益倍率并同步刷新 UI 滑块与预设按钮。
+
+### 7.2 实时热插拔监听与智能回退栈 (Hotplug & Fallback Stack)
+为实现“插上新麦克风自动切过去，拔下时自动平滑回退到上一个设备”的高可用体验：
+1. **系统级消息监听**：捕获 Windows 顶层广播消息 `WM_DEVICECHANGE (0x0219)`，并设置 350ms 去抖定时器（等待 WASAPI 端点完全就绪）。
+2. **音频流中断即时感知**：当正在工作的麦克风被物理拔除时，WASAPI 渲染流回调立即捕获异常并存入 `controller.last_error`，在 33ms 定时器内实现毫秒级即时断开感知。
+3. **心跳双重保障**：每隔 1 秒执行静默设备扫描，防止蓝牙/无线驱动未广播标准硬件插拔消息。
+4. **MRU 历史回退栈 (Most Recently Used Stack)**：
+   - 插入新麦克风：将当前设备压入历史栈底，切换至新麦克风并记录到栈顶，加载新设备专属增益并无缝重启流；
+   - 拔出当前麦克风：逆序遍历历史记录栈，选取最近使用过的仍在线设备（MRU Fallback），恢复其专属增益并无缝接续音频流；
+   - 设备全部拔除：安全重置界面状态，显示“无可用麦克风”，停止音频管道避免空转。
+
